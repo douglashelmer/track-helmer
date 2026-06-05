@@ -8,7 +8,7 @@ import crypto from "node:crypto";
 import { q, pool } from "./db.js";
 import { sendEvents, capiEnabled } from "./capi.js";
 import { syncSpend } from "./spend.js";
-import { getRows, renderHtml } from "./dashboard.js";
+import { getRows, renderHtml, presetRange } from "./dashboard.js";
 
 const sha = (v) =>
   v == null || v === ""
@@ -179,15 +179,24 @@ const authed = (req) => !ADMIN_KEY || req.query.key === ADMIN_KEY;
 
 app.get("/dashboard", async (req, reply) => {
   if (!authed(req)) return reply.code(401).send("unauthorized");
-  const rows = await getRows();
-  return reply.type("text/html").send(renderHtml(rows, req.query.key));
+  const qy = req.query;
+  let since = qy.since, until = qy.until, preset = qy.preset;
+  if (!preset && !since && !until) preset = "30d";
+  if (preset) { const r = presetRange(preset); if (r) { since = r.since; until = r.until; } }
+  const group = ["ad", "adset", "campaign"].includes(qy.group) ? qy.group : "ad";
+  const status = ["paid", "all", "pending", "refunded", "chargeback"].includes(qy.status) ? qy.status : "paid";
+  const rows = await getRows({ since, until, group, status });
+  return reply.type("text/html").send(renderHtml(rows, { key: qy.key, since, until, preset: preset || "", group, status }));
 });
 
 app.get("/admin/sync", async (req, reply) => {
   if (!authed(req)) return reply.code(401).send("unauthorized");
-  const r = await syncSpend(req.query.preset || "last_30d");
+  const preset = req.query.preset || "30d";
+  const meta = (presetRange(preset) || {}).meta || "last_30d";
+  const r = await syncSpend(meta);
   req.log.info({ syncSpend: r }, "spend synced");
-  return reply.redirect("/dashboard?key=" + encodeURIComponent(req.query.key || ""));
+  const g = req.query.group || "ad", s = req.query.status || "paid";
+  return reply.redirect(`/dashboard?key=${encodeURIComponent(req.query.key || "")}&preset=${preset}&group=${g}&status=${s}`);
 });
 
 setInterval(() => { syncSpend().catch(() => {}); }, 6 * 3600 * 1000);
