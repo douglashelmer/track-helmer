@@ -7,6 +7,8 @@ import { readFileSync } from "node:fs";
 import crypto from "node:crypto";
 import { q, pool } from "./db.js";
 import { sendEvents, capiEnabled } from "./capi.js";
+import { syncSpend } from "./spend.js";
+import { getRows, renderHtml } from "./dashboard.js";
 
 const sha = (v) =>
   v == null || v === ""
@@ -170,6 +172,25 @@ app.post("/webhook/greenn", async (req, reply) => {
 
   return { ok: true, order_id: orderId, status, ad_id: adId, matched_session: !!m.visitor_id, capi: capi.skipped ? "disabled" : capi.ok };
 });
+
+// ---- Dashboard + spend sync (key-protected) ----------------------------------
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const authed = (req) => !ADMIN_KEY || req.query.key === ADMIN_KEY;
+
+app.get("/dashboard", async (req, reply) => {
+  if (!authed(req)) return reply.code(401).send("unauthorized");
+  const rows = await getRows();
+  return reply.type("text/html").send(renderHtml(rows, req.query.key));
+});
+
+app.get("/admin/sync", async (req, reply) => {
+  if (!authed(req)) return reply.code(401).send("unauthorized");
+  const r = await syncSpend(req.query.preset || "last_30d");
+  req.log.info({ syncSpend: r }, "spend synced");
+  return reply.redirect("/dashboard?key=" + encodeURIComponent(req.query.key || ""));
+});
+
+setInterval(() => { syncSpend().catch(() => {}); }, 6 * 3600 * 1000);
 
 const port = Number(process.env.PORT || 8080);
 app.listen({ port, host: "0.0.0.0" }).then(() => console.log("track-helmer on :" + port));
