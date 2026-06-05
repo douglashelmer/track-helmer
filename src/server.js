@@ -4,8 +4,14 @@ import fstatic from "@fastify/static";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
+import crypto from "node:crypto";
 import { q, pool } from "./db.js";
 import { sendEvents, capiEnabled } from "./capi.js";
+
+const sha = (v) =>
+  v == null || v === ""
+    ? null
+    : crypto.createHash("sha256").update(String(v).trim().toLowerCase()).digest("hex");
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -83,9 +89,86 @@ app.post("/collect", async (req, reply) => {
   return { ok: true, capi: r.skipped ? "disabled" : r.ok };
 });
 
+// ---- Greenn sale webhook → sales row + Purchase CAPI (dedup event_id) ---------
+const parseId = (v) => {
+  if (!v) return null;
+  const after = v.includes("|") ? v.split("|").pop() : v;
+  return (after.split("::")[0] || "").trim() || null;
+};
+const mapStatus = (s) => {
+  s = (s || "").toLowerCase();
+  if (s === "paid") return "paid";
+  if (s.includes("refund")) return "refunded";
+  if (s.includes("charge")) return "chargeback";
+  if (s.includes("wait") || s === "pending" || s === "unpaid") return "pending";
+  return s || "unknown";
+};
+
 app.post("/webhook/greenn", async (req, reply) => {
-  req.log.info({ greenn: req.body }, "greenn webhook received");
-  return reply.send({ ok: true, note: "stub — mapping in Phase 2" });
+  const secret = process.env.GREENN_WEBHOOK_TOKEN;
+  if (secret && req.headers["x-webhook-token"] !== secret) return reply.code(401).send({ error: "bad token" });
+
+  let p = req.body;
+  if (Array.isArray(p)) p = p[0];
+  if (p && p.body) p = p.body;
+  if (!p || !p.sale) return reply.code(400).send({ error: "no sale in payload" });
+
+  const sale = p.sale;
+  const client = p.client || {};
+  const metas = Object.fromEntries((p.saleMetas || []).map((m) => [m.meta_key, m.meta_value]));
+  const status = mapStatus(p.currentStatus || sale.status);
+  const orderId = String(sale.id);
+  const eventId = "greenn-" + orderId;
+  const fbclid = metas.fbclid || null;
+
+  let m = {};
+  if (fbclid) {
+    const r = await q(
+      `SELECT visitor_id, fbp, fbc, ip, user_agent FROM events WHERE fbclid=$1 ORDER BY event_time DESC LIMIT 1`,
+      [fbclid]
+    );
+    m = r.rows[0] || {};
+  }
+  const fbc =
+    m.fbc ||
+    (fbclid ? `fb.1.${Math.floor(new Date(sale.created_at || Date.now()).getTime() / 1000)}.${fbclid}` : null);
+
+  const value = sale.amount ?? sale.total ?? null;
+  const currency = p.currency || "BRL";
+  const adId = parseId(metas.utm_content);
+
+  await q(
+    `INSERT INTO sales (order_id,status,value,currency,product,payment_method,email_hash,phone_hash,city,state,zip,country,
+       utm_source,utm_medium,utm_campaign,utm_content,utm_term,xcod,campaign_id,adset_id,ad_id,visitor_id,event_id,fbp,fbc,paid_at,raw)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+     ON CONFLICT (order_id) DO UPDATE SET status=EXCLUDED.status, paid_at=EXCLUDED.paid_at, raw=EXCLUDED.raw`,
+    [orderId, status, value, currency, p.product?.name || null, sale.method || null,
+     sha(client.email), sha(client.cellphone ? String(client.cellphone).replace(/\D/g, "") : null),
+     client.city || null, client.uf || null, client.zipcode || null, "br",
+     metas.utm_source || null, metas.utm_medium || null, metas.utm_campaign || null, metas.utm_content || null,
+     metas.utm_term || null, metas.xcod || null,
+     parseId(metas.utm_campaign), parseId(metas.utm_medium), adId, m.visitor_id || null, eventId,
+     m.fbp || null, fbc, sale.paid_at || null, JSON.stringify(p)]
+  );
+
+  let capi = { skipped: true };
+  if (status === "paid") {
+    capi = await sendEvents([{
+      event_name: "Purchase",
+      event_time: sale.paid_at || Date.now(),
+      event_id: eventId,
+      page_url: "https://nexia.helmer.com.br/",
+      value, currency, content_type: "product",
+      content_ids: [String(p.product?.id || "nexia")],
+      order_id: orderId,
+      email: client.email, phone: client.cellphone,
+      city: client.city, state: client.uf, zip: client.zipcode, country: "br",
+      visitor_id: m.visitor_id, fbp: m.fbp, fbc, ip: m.ip, user_agent: m.user_agent,
+    }]).catch((e) => ({ ok: false, body: String(e) }));
+    if (!capi.skipped) await q(`UPDATE sales SET capi_sent=$1 WHERE order_id=$2`, [!!capi.ok, orderId]);
+  }
+
+  return { ok: true, order_id: orderId, status, ad_id: adId, matched_session: !!m.visitor_id, capi: capi.skipped ? "disabled" : capi.ok };
 });
 
 const port = Number(process.env.PORT || 8080);
