@@ -8,7 +8,7 @@ import crypto from "node:crypto";
 import { q, pool } from "./db.js";
 import { sendEvents, capiEnabled } from "./capi.js";
 import { syncSpend } from "./spend.js";
-import { getRows, renderHtml, presetRange } from "./dashboard.js";
+import { getRows, getData, renderHtml, presetRange } from "./dashboard.js";
 
 const sha = (v) =>
   v == null || v === ""
@@ -141,16 +141,17 @@ app.post("/webhook/greenn", async (req, reply) => {
 
   await q(
     `INSERT INTO sales (order_id,status,value,currency,product,payment_method,email_hash,phone_hash,city,state,zip,country,
-       utm_source,utm_medium,utm_campaign,utm_content,utm_term,xcod,campaign_id,adset_id,ad_id,visitor_id,event_id,fbp,fbc,paid_at,raw)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
-     ON CONFLICT (order_id) DO UPDATE SET status=EXCLUDED.status, paid_at=EXCLUDED.paid_at, raw=EXCLUDED.raw`,
+       utm_source,utm_medium,utm_campaign,utm_content,utm_term,xcod,campaign_id,adset_id,ad_id,visitor_id,event_id,fbp,fbc,paid_at,fee,net_value,raw)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+     ON CONFLICT (order_id) DO UPDATE SET status=EXCLUDED.status, value=EXCLUDED.value, paid_at=EXCLUDED.paid_at,
+       fee=EXCLUDED.fee, net_value=EXCLUDED.net_value, raw=EXCLUDED.raw`,
     [orderId, status, value, currency, p.product?.name || null, sale.method || null,
      sha(client.email), sha(client.cellphone ? String(client.cellphone).replace(/\D/g, "") : null),
      client.city || null, client.uf || null, client.zipcode || null, "br",
      metas.utm_source || null, metas.utm_medium || null, metas.utm_campaign || null, metas.utm_content || null,
      metas.utm_term || null, metas.xcod || null,
      parseId(metas.utm_campaign), parseId(metas.utm_medium), adId, m.visitor_id || null, eventId,
-     m.fbp || null, fbc, sale.paid_at || null, JSON.stringify(p)]
+     m.fbp || null, fbc, sale.paid_at || null, sale.fee ?? null, sale.seller_balance ?? null, JSON.stringify(p)]
   );
 
   let capi = { skipped: true };
@@ -185,8 +186,8 @@ app.get("/dashboard", async (req, reply) => {
   if (preset) { const r = presetRange(preset); if (r) { since = r.since; until = r.until; } }
   const group = ["ad", "adset", "campaign"].includes(qy.group) ? qy.group : "ad";
   const status = ["paid", "all", "pending", "refunded", "chargeback"].includes(qy.status) ? qy.status : "paid";
-  const rows = await getRows({ since, until, group, status });
-  return reply.type("text/html").send(renderHtml(rows, { key: qy.key, since, until, preset: preset || "", group, status }));
+  const [rows, data] = await Promise.all([getRows({ since, until, group, status }), getData({ since, until })]);
+  return reply.type("text/html").send(renderHtml(rows, data, { key: qy.key, since, until, preset: preset || "", group, status }));
 });
 
 app.get("/admin/sync", async (req, reply) => {

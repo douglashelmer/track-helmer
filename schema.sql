@@ -93,3 +93,7 @@ CREATE TABLE IF NOT EXISTS ad_spend (
   pulled_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (date, ad_id)
 );
+
+-- Incremental columns (safe to re-run on an existing DB).
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS fee        NUMERIC(12,2);
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS net_value  NUMERIC(12,2);
